@@ -9,14 +9,27 @@ Uso:
     python3 alerta_semanal.py                 # alerta en terminal
     python3 alerta_semanal.py --capital 300   # cambia el aporte semanal
     python3 alerta_semanal.py --html          # además exporta alerta_semanal.html
+    python3 alerta_semanal.py --email         # envía la alerta por email
     python3 alerta_semanal.py --no-color      # sin colores ANSI
+
+Email (Gmail) — requiere una "Contraseña de aplicación" de Google, NO tu clave normal:
+    1. Activa la verificación en 2 pasos en https://myaccount.google.com/security
+    2. Crea una App Password en https://myaccount.google.com/apppasswords
+    3. Exporta las credenciales (en ~/.bashrc para que persistan):
+         export SMTP_USER="tucorreo@gmail.com"
+         export SMTP_PASS="la-app-password-de-16-letras"
+       Opcionales: SMTP_TO (destinatario), SMTP_HOST, SMTP_PORT
+    Destinatario por defecto: edujerezwilson@gmail.com
 
 Automatizar (cron, cada lunes 9:00, usando el venv del proyecto):
     0 9 * * 1  cd /home/wilson/Documentos/crypto-analysis && \
-               venv/bin/python alerta_semanal.py --html >> alerta.log 2>&1
+               SMTP_USER="tucorreo@gmail.com" SMTP_PASS="app-password" \
+               venv/bin/python alerta_semanal.py --email --html >> alerta.log 2>&1
 """
-import sys, argparse, warnings
+import os, sys, ssl, smtplib, argparse, warnings
 from datetime import datetime
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -149,7 +162,7 @@ def classify(tk, s):
     return 2, '🟡 NORMAL', 'Aporte normal a mercado', C.YEL
 
 # ───────────────────────────── SALIDA ─────────────────────────────────────────
-def run(capital, want_html):
+def run(capital, want_html, want_email, email_to):
     print(f'{C.DIM}Descargando datos semanales del universo...{C.R}')
     DCA = {}
     for tk in UNIVERSE:
@@ -218,8 +231,10 @@ def run(capital, want_html):
 
     if want_html:
         export_html(alerts, final, capital, fecha, by_class)
+    if want_email:
+        send_email(alerts, final, capital, fecha, by_class, email_to)
 
-def export_html(alerts, final, capital, fecha, by_class):
+def build_html(alerts, final, capital, fecha, by_class):
     cls_color = {'Cripto':'#f7931a','Renta Variable':'#42a5f5','Refugio':'#ffd54f'}
     zcol = {0:'#26c6da',1:'#00c853',2:'#ffd600',3:'#ff5252',4:'#777'}
     titulos = {0:'🔵 OPORTUNIDAD — DOBLA el aporte',1:'🟢 PULLBACK — sobreponderá',
@@ -250,17 +265,61 @@ def export_html(alerts, final, capital, fecha, by_class):
   {bloques}
   <p style="color:#555;font-size:12px;text-align:center">Generado {datetime.now().strftime('%d/%m/%Y %H:%M')} · Educativo, no es asesoría financiera.</p>
 </div></body></html>'''
+    return html
+
+def export_html(alerts, final, capital, fecha, by_class):
+    html = build_html(alerts, final, capital, fecha, by_class)
     with open('alerta_semanal.html', 'w', encoding='utf-8') as f:
         f.write(html)
     print(f'  {C.GRN}✓ HTML exportado: alerta_semanal.html{C.R}')
+
+def email_subject(alerts, fecha):
+    opps  = [a['tk'] for a in alerts if a['urg'] == 0]
+    pulls = [a['tk'] for a in alerts if a['urg'] == 1]
+    if opps:
+        return f"🔵 DCA {fecha}: OPORTUNIDAD en {', '.join(opps)} (dobla aporte)"
+    if pulls:
+        return f"🟢 DCA {fecha}: pullback en {', '.join(pulls)} (sobreponderá)"
+    return f"🔔 DCA {fecha}: aporte semanal normal"
+
+def send_email(alerts, final, capital, fecha, by_class, to_addr):
+    user = os.environ.get('SMTP_USER')
+    pw   = os.environ.get('SMTP_PASS')
+    host = os.environ.get('SMTP_HOST', 'smtp.gmail.com')
+    port = int(os.environ.get('SMTP_PORT', '587'))
+    if not user or not pw:
+        print(f'  {C.RED}✗ Email no enviado: faltan SMTP_USER / SMTP_PASS '
+              f'(ver instrucciones en la cabecera del script).{C.R}')
+        return False
+    html = build_html(alerts, final, capital, fecha, by_class)
+    msg = MIMEMultipart('alternative')
+    msg['Subject'] = email_subject(alerts, fecha)
+    msg['From'], msg['To'] = user, to_addr
+    resumen = '; '.join(f'{a["tk"]} {a["zona"]}' for a in alerts)
+    msg.attach(MIMEText(f'Alerta DCA {fecha}\n{resumen}\n\n(abre en HTML para el detalle)', 'plain'))
+    msg.attach(MIMEText(html, 'html'))
+    try:
+        ctx = ssl.create_default_context()
+        with smtplib.SMTP(host, port, timeout=30) as s:
+            s.starttls(context=ctx)
+            s.login(user, pw)
+            s.sendmail(user, [to_addr], msg.as_string())
+        print(f'  {C.GRN}✓ Email enviado a {to_addr}{C.R}')
+        return True
+    except Exception as e:
+        print(f'  {C.RED}✗ Error enviando email: {e}{C.R}')
+        return False
 
 # ───────────────────────────── MAIN ───────────────────────────────────────────
 if __name__ == '__main__':
     ap = argparse.ArgumentParser(description='Alerta DCA semanal')
     ap.add_argument('--capital', type=float, default=200, help='Aporte semanal en USD')
     ap.add_argument('--html', action='store_true', help='Exporta alerta_semanal.html')
+    ap.add_argument('--email', action='store_true', help='Envía la alerta por email (SMTP)')
+    ap.add_argument('--email-to', default=os.environ.get('SMTP_TO', 'edujerezwilson@gmail.com'),
+                    help='Destinatario del email')
     ap.add_argument('--no-color', action='store_true', help='Desactiva colores ANSI')
     args = ap.parse_args()
     if args.no_color or not sys.stdout.isatty():
         nocolor()
-    run(args.capital, args.html)
+    run(args.capital, args.html, args.email, args.email_to)
