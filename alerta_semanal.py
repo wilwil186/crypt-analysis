@@ -10,7 +10,19 @@ Uso:
     python3 alerta_semanal.py --capital 300   # cambia el aporte semanal
     python3 alerta_semanal.py --html          # además exporta alerta_semanal.html
     python3 alerta_semanal.py --email         # envía la alerta por email
+    python3 alerta_semanal.py --telegram      # envía la alerta por Telegram
     python3 alerta_semanal.py --no-color      # sin colores ANSI
+
+Telegram — requiere un bot (gratis, 2 min). El @usuario/teléfono NO bastan:
+    1. En Telegram abre @BotFather, manda /newbot y sigue los pasos.
+       Te dará un TOKEN tipo 123456789:AAxx...  -> exporta:
+         export TELEGRAM_BOT_TOKEN="123456789:AAxx..."
+    2. Abre tu nuevo bot en Telegram y mándale /start (cualquier mensaje).
+    3. Descubre tu chat_id ejecutando:
+         python3 alerta_semanal.py --telegram-setup
+       Copia el id que imprime y expórtalo:
+         export TELEGRAM_CHAT_ID="123456789"
+    4. Listo: python3 alerta_semanal.py --telegram
 
 Email (Gmail) — requiere una "Contraseña de aplicación" de Google, NO tu clave normal:
     1. Activa la verificación en 2 pasos en https://myaccount.google.com/security
@@ -30,6 +42,7 @@ import os, sys, ssl, smtplib, argparse, warnings
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+import requests
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -162,7 +175,7 @@ def classify(tk, s):
     return 2, '🟡 NORMAL', 'Aporte normal a mercado', C.YEL
 
 # ───────────────────────────── SALIDA ─────────────────────────────────────────
-def run(capital, want_html, want_email, email_to):
+def run(capital, want_html, want_email, email_to, want_telegram):
     print(f'{C.DIM}Descargando datos semanales del universo...{C.R}')
     DCA = {}
     for tk in UNIVERSE:
@@ -233,6 +246,8 @@ def run(capital, want_html, want_email, email_to):
         export_html(alerts, final, capital, fecha, by_class)
     if want_email:
         send_email(alerts, final, capital, fecha, by_class, email_to)
+    if want_telegram:
+        send_telegram(alerts, final, capital, fecha, by_class)
 
 def build_html(alerts, final, capital, fecha, by_class):
     cls_color = {'Cripto':'#f7931a','Renta Variable':'#42a5f5','Refugio':'#ffd54f'}
@@ -310,6 +325,70 @@ def send_email(alerts, final, capital, fecha, by_class, to_addr):
         print(f'  {C.RED}✗ Error enviando email: {e}{C.R}')
         return False
 
+# ───────────────────────────── TELEGRAM ───────────────────────────────────────
+def build_telegram_text(alerts, capital, fecha, by_class):
+    titulos = {0:'🔵 OPORTUNIDAD — DOBLA', 1:'🟢 PULLBACK — sobreponderá',
+               2:'🟡 NORMAL', 3:'🔴 EUFORIA — reduce', 4:'⚫ FUERA — no acumular'}
+    div = ' · '.join(f'{k} {v/capital*100:.0f}%' for k, v in sorted(by_class.items(), key=lambda x:-x[1]))
+    lines = [f'<b>🔔 Alerta DCA — {fecha}</b>', f'Capital ${capital:.0f}/sem · {div}', '']
+    for urg in sorted(set(a['urg'] for a in alerts)):
+        subs = [a for a in alerts if a['urg'] == urg]
+        lines.append(f'<b>{titulos[urg]}</b>')
+        for a in subs:
+            lines.append(f'• {a["tk"]} ${a["price"]:,.2f} (aporte ${a["aporte"]:.0f})')
+        lines.append('')
+    extra = sum(a['aporte'] for a in alerts if a['urg'] in (0, 1))
+    lines.append(f'Aporta ${capital:.0f} base; hasta ${extra:.0f} extra en 🔵/🟢.')
+    return '\n'.join(lines)
+
+def send_telegram(alerts, final, capital, fecha, by_class):
+    token = os.environ.get('TELEGRAM_BOT_TOKEN')
+    chat  = os.environ.get('TELEGRAM_CHAT_ID')
+    if not token or not chat:
+        print(f'  {C.RED}✗ Telegram no enviado: faltan TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID '
+              f'(ver instrucciones en la cabecera del script).{C.R}')
+        return False
+    text = build_telegram_text(alerts, capital, fecha, by_class)
+    try:
+        r = requests.post(f'https://api.telegram.org/bot{token}/sendMessage',
+                          data={'chat_id': chat, 'text': text, 'parse_mode': 'HTML',
+                                'disable_web_page_preview': True}, timeout=30)
+        if r.status_code == 200 and r.json().get('ok'):
+            print(f'  {C.GRN}✓ Telegram enviado (chat {chat}){C.R}')
+            return True
+        print(f'  {C.RED}✗ Telegram rechazado: {r.text[:200]}{C.R}')
+        return False
+    except Exception as e:
+        print(f'  {C.RED}✗ Error enviando Telegram: {e}{C.R}')
+        return False
+
+def telegram_setup():
+    """Descubre tu chat_id tras enviarle /start al bot."""
+    token = os.environ.get('TELEGRAM_BOT_TOKEN')
+    if not token:
+        print(f'{C.RED}Exporta TELEGRAM_BOT_TOKEN primero (ver cabecera del script).{C.R}')
+        return
+    try:
+        r = requests.get(f'https://api.telegram.org/bot{token}/getUpdates', timeout=30)
+        data = r.json()
+    except Exception as e:
+        print(f'{C.RED}Error consultando Telegram: {e}{C.R}'); return
+    if not data.get('ok'):
+        print(f'{C.RED}Token inválido o error: {data}{C.R}'); return
+    chats = {}
+    for u in data.get('result', []):
+        m = u.get('message') or u.get('edited_message') or u.get('channel_post') or {}
+        ch = m.get('chat', {})
+        if ch.get('id'): chats[ch['id']] = ch
+    if not chats:
+        print(f'{C.YEL}No hay mensajes todavía. Abre tu bot en Telegram y mándale /start, '
+              f'luego repite este comando.{C.R}')
+        return
+    print(f'{C.GRN}Chats encontrados (usa el id en TELEGRAM_CHAT_ID):{C.R}')
+    for cid, ch in chats.items():
+        quien = ch.get('username') or ch.get('first_name') or ch.get('title') or '?'
+        print(f'  {C.B}{cid}{C.R}  ({quien})')
+
 # ───────────────────────────── MAIN ───────────────────────────────────────────
 if __name__ == '__main__':
     ap = argparse.ArgumentParser(description='Alerta DCA semanal')
@@ -318,8 +397,14 @@ if __name__ == '__main__':
     ap.add_argument('--email', action='store_true', help='Envía la alerta por email (SMTP)')
     ap.add_argument('--email-to', default=os.environ.get('SMTP_TO', 'edujerezwilson@gmail.com'),
                     help='Destinatario del email')
+    ap.add_argument('--telegram', action='store_true', help='Envía la alerta por Telegram')
+    ap.add_argument('--telegram-setup', action='store_true',
+                    help='Descubre tu chat_id (mándale /start al bot antes)')
     ap.add_argument('--no-color', action='store_true', help='Desactiva colores ANSI')
     args = ap.parse_args()
     if args.no_color or not sys.stdout.isatty():
         nocolor()
-    run(args.capital, args.html, args.email, args.email_to)
+    if args.telegram_setup:
+        telegram_setup()
+        sys.exit(0)
+    run(args.capital, args.html, args.email, args.email_to, args.telegram)
