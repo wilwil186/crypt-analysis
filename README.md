@@ -11,7 +11,7 @@ El notebook `crypto_analysis.ipynb` ejecuta un pipeline completo:
 3. **Genera un score DCA 0–100** por activo con dos pilares: calidad de tendencia + valor de entrada
 4. **Asigna capital mensual** solo a activos en uptrend confirmado (precio > SMA40 semanal)
 5. **Backtestea** la estrategia con walk-forward sin lookahead (~4–5 años de historia)
-6. **Envía una alerta mensual a Telegram** con el ranking de las 20 criptos, zonas de entrada, RSI y señal SuperTrend
+6. **Imprime una alerta mensual** con el ranking de las 20 criptos, zonas de entrada, RSI y señal SuperTrend
 
 ## Estructura del pipeline
 
@@ -24,7 +24,7 @@ El notebook `crypto_analysis.ipynb` ejecuta un pipeline completo:
 | §13 Motor DCA | Elegibilidad, asignación semanal, zonas de entrada |
 | §14 Optimización | Métricas ajustadas por riesgo, sleeve de convicción BTC/ETH, walk-forward |
 | §15 Alertas | `monthly_alert()` — genera el reporte de todas las 20 criptos |
-| §16 Telegram | Envía el mensaje al bot configurado |
+| §16 Alerta | Imprime el plan DCA mensual completo en el notebook |
 
 ## Instalación
 
@@ -36,17 +36,6 @@ source venv/bin/activate
 ```
 
 `install_talib.sh` compila TA-Lib desde fuente e instala: `numpy`, `pandas`, `plotly`, `mplfinance`, `yfinance`, `TA-Lib`, `prophet`, `scikit-learn`, `scipy`.
-
-## Configuración de Telegram
-
-Crea un bot con [@BotFather](https://t.me/BotFather) y exporta las variables:
-
-```bash
-export TELEGRAM_BOT_TOKEN="123456:AAxx..."
-export TELEGRAM_CHAT_ID="1653509510"
-```
-
-O pégalas directamente en la celda §16 (no las commitees).
 
 ## Ejecución
 
@@ -69,9 +58,9 @@ CONVICTION_CRYPTO = 0.30       # % fijo reservado a BTC+ETH (sleeve convicción)
 MAX_PER_ASSET    = 0.30        # tope máximo por activo
 ```
 
-## Mensaje Telegram
+## Alerta mensual (última celda)
 
-El mensaje mensual incluye:
+La última celda imprime el plan DCA completo directamente en el notebook:
 
 - **Tu cartera este mes**: activos elegibles con % de aporte, precio, RSI, SuperTrend (↑/↓) y distancia a SMA40
 - **Ranking top-20**: barra de score visual, señal SuperTrend y RSI para cada cripto analizada
