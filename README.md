@@ -4,7 +4,7 @@ Sistema de análisis cuantitativo de criptomonedas que produce un plan de invers
 
 ## ¿Qué hace?
 
-El notebook `crypto_analysis.ipynb` ejecuta un pipeline completo de 64 celdas:
+El notebook `crypto_analysis.ipynb` ejecuta un pipeline completo de 66 celdas:
 
 1. Descarga el **top-20 de criptos** por capitalización de mercado (CoinGecko) en tiempo real
 2. Calcula **indicadores técnicos** sobre datos diarios y semanales: SMA, RSI, MACD, ATR, Fibonacci, SuperTrend
@@ -135,6 +135,12 @@ MAX_PER_ASSET     = 0.30       # tope máximo por activo individual
 | 30 | Markdown | Encabezado |
 | 31 | Código | Síntesis de `PRIMARY`: calcula TP (precio + 2.5×ATR), SL (precio − 1.5×ATR), ratio R/R; imprime recomendación con contexto de mercado |
 
+### §12b — Régimen de Mercado (HMM)
+| Celda | Tipo | Qué hace |
+|-------|------|----------|
+| 37 | Markdown | Descripción del modelo de régimen de mercado |
+| 38 | Código | Entrena un `GaussianHMM` de 3 estados sobre BTC-USD semanal con features: retorno 4 semanas, volatilidad rolling 8 semanas, RSI semanal. Etiqueta los estados como BULL/NEUTRAL/BEAR por retorno medio histórico. Expone `REGIME_NOW`. Muestra gráfico Plotly con precio BTC coloreado por régimen |
+
 ---
 
 ### §13 — Motor DCA (producto principal)
@@ -144,9 +150,9 @@ MAX_PER_ASSET     = 0.30       # tope máximo por activo individual
 | 33 | Código | **Parámetros DCA**: `MONTHLY_CAPITAL`, `MAX_PER_ASSET`, `WK_PERIOD`; descarga datos **semanales** (`1wk`) de 5 años para todo el universo en `WK` |
 | 34 | Código | `supertrend_signal(h,l,c)` — SuperTrend basado en ATR×factor (inspirado en OctoBot); `lt_features(d)` — indicadores semanales LP: SMA10/30/40, RSI, MACD, MOM26/52, ATR, DDhigh, SuperTrend; `dca_score(x)` — score DCA 0–100 (tendencia 0–60 + valor entrada 0–40 + bonus ST); aplica a todo `WK` generando `WKI` y `DCA` |
 | 35 | Markdown | Descripción de la asignación de capital |
-| 36 | Código | Filtra activos elegibles (precio > SMA40 + `trend_quality ≥ 35`); calcula pesos proporcionales al score con tope `MAX_PER_ASSET`; tabla `alloc` con USD asignados este mes |
-| 37 | Código | Gráfico de asignación: dona de pesos + barras de score DCA por activo |
-| 38 | Markdown | Descripción de los niveles de entrada |
+| 36 | Código | Filtra activos elegibles (precio > SMA40 + `trend_quality ≥ 35`); calcula pesos con **HRP-CVaR** (Riskfolio-Lib) usando retornos semanales alineados; fallback a score-proporcional; tope `MAX_PER_ASSET`; tabla `alloc` con USD asignados este mes |
+| 39 | Código | Gráfico de asignación: dona de pesos + barras de score DCA por activo |
+| 40 | Markdown | Descripción de los niveles de entrada |
 | 39 | Código | Calcula zonas de entrada por activo: SMA30 (sobreponderar), SMA40 (oportunidad fuerte), SMA40×1.25 (euforia) |
 | 40 | Markdown | Descripción de la validación DCA vs Lump Sum |
 | 41 | Código | `dca_sim(close, amount)` — simula DCA aportando cantidad fija cada semana; compara vs inversión única (Lump Sum) sobre `PRIMARY` y la cesta diversificada |
@@ -161,7 +167,7 @@ MAX_PER_ASSET     = 0.30       # tope máximo por activo individual
 | 46 | Código | `perf_stats(close)` — métricas ajustadas por riesgo: CAGR, volatilidad, Sharpe, Sortino, MaxDrawdown, Calmar; tabla comparativa de todos los activos |
 | 47 | Código | Mapa riesgo-retorno: scatter CAGR vs volatilidad, tamaño del punto = Sharpe |
 | 48 | Markdown | Encabezado §14.2 — sleeve de convicción |
-| 49 | Código | Define `CONVICTION_CRYPTO = 0.30` (BTC + ETH siempre); separa sleeve convicción del sleeve tendencia (resto de cryptos elegibles); combina en `final_w` y `final_alloc` |
+| 51 | Código | Define `CONVICTION_CRYPTO = 0.30` (BTC + ETH siempre); aplica `REGIME_NOW`: BEAR=solo convicción, NEUTRAL=tendencia al 50%, BULL=sin cambios; combina en `final_w` y `final_alloc` |
 | 50 | Markdown | Encabezado §14.3 — backtest walk-forward |
 | 51 | Código | Construye `PX` (matriz de precios semanal alineada con unión de fechas + ffill); `weights_at(t, mode)` — calcula pesos en cada fecha sin lookahead; `run_dca(mode)` — simula DCA semana a semana; compara estrategia convicción+tendencia vs equal-weight vs solo-BTC |
 | 52 | Código | Gráfico de curvas de equity de las tres estrategias; imprime IRR anual y MaxDrawdown |
@@ -201,6 +207,8 @@ MAX_PER_ASSET     = 0.30       # tope máximo por activo individual
 | Fibonacci (automático) | Retrocesos sobre el swing reciente |
 | Prophet | Forecast de precio a 30 días con incertidumbre |
 | GradientBoosting | Clasificador direccional a 5 días |
+| HMM Gaussiano (3 estados) | Régimen de mercado BULL/NEUTRAL/BEAR sobre BTC semanal |
+| HRP-CVaR (Riskfolio-Lib) | Pesos óptimos del sleeve de tendencia por Hierarchical Risk Parity |
 
 ## Score DCA — cómo se calcula
 
