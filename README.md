@@ -13,8 +13,8 @@ El notebook `crypto_analysis.ipynb` ejecuta un pipeline completo de 71 celdas:
 5. Genera un **score DCA 0–100** por activo con tres pilares: tendencia (55) + valor de entrada (35) + sentimiento (10)
 6. Asigna **capital mensual** con HRP-CVaR (Riskfolio-Lib) solo a los top-5 altcoins por momentum, más el sleeve de convicción BTC/ETH
 7. **Backtestea** la estrategia con walk-forward sin lookahead (~4–5 años de historia)
-8. Calcula **señales de venta y rebalanceo**: SELL_SCORE técnico + desviación del peso objetivo (equal-weight 5%)
-9. Imprime una **alerta mensual completa** con ranking, zonas de entrada, RSI y señal SuperTrend
+8. Calcula el **SELL_SCORE** técnico (0–100) por activo y lo combina con la zona DCA para producir una señal **ACCIÓN_FINAL** unificada sin contradicciones
+9. Imprime **una única alerta mensual** con la cartera (qué % comprar o reducir), candidatos de compra fuera del plan, y activos a pausar
 
 ---
 
@@ -204,14 +204,14 @@ CONVICTION_CRYPTO = 0.30       # % fijo reservado a BTC + ETH
 | 64 | Código | Walk-forward v2: estrategia completa vs solo-convicción vs equal-weight vs solo-BTC; tabla con Sharpe y Calmar |
 | 65 | Código | Gráfico comparativo de las 4 curvas de valor acumulado |
 | 66 | Markdown | Encabezado §15.3 — alerta mensual |
-| 67 | Código | `monthly_alert(plan_weights)` — recorre todos los activos del universo; clasifica por zona (euforia / pullback / oportunidad / normal / fuera de tendencia); devuelve `alert` ordenada por urgencia |
-| 68 | Código | **Celda final de alerta** — imprime badge FNG + plan DCA mensual completo: cartera con % por activo, ranking top-20 con barra de score visual, activos fuera de tendencia, activos en vigilancia, instrucciones de acción |
+| 67 | Código | Define `sell_score(tk)` (disponible aquí para uso interno). `monthly_alert(plan_weights)` — recorre todos los activos del universo; clasifica por zona (euforia / pullback / oportunidad / normal / fuera de tendencia); llama a `sell_score(tk)` y añade columna `SELL_SCORE`; aplica las **7 reglas de prioridad** para producir columna `ACCIÓN_FINAL` unificada; devuelve `alert` ordenada por urgencia. Sin output — el DataFrame se usa en la celda siguiente |
+| 68 | Código | **Alerta mensual unificada** — única salida visible al final del notebook. Tres bloques: 💼 **CARTERA** (activos en el plan con ACCIÓN_FINAL, aporte en $ y %, SELL_SCORE, RSI y ST), 💡 **SEÑALES DE COMPRA** (candidatos fuera del plan con 🔵/🟢), ⚫ **PAUSAR DCA** (activos que perdieron SMA40). Pie con instrucciones de acción |
 
-### §17 — Señales de Venta y Rebalanceo
+### §17 — Señales de Venta y Rebalanceo (cómputo interno)
 | Celda | Tipo | Qué hace |
 |-------|------|----------|
 | 69 | Markdown | Descripción de las dos capas de señales |
-| 70 | Código | **Capa 1** `sell_score(tk)` (0–100): +25 EMA bajista (Close < EMA50 < EMA200), +20 RSI > 75, +15 MACD < señal con histograma decreciendo 3 velas, +15 precio > BBu, +10 ADX > 30 con MDI > PDI, +15 SuperTrend semanal −1. **Capa 2** rebalanceo hipotético: simula portafolio igual-peso desde hace 52 semanas, calcula desviación actual vs `TARGET_WEIGHT`. **Tabla consolidada**: Activo \| Precio \| SELL_SCORE \| Señal Técnica \| Peso actual % \| Desviación % \| DCA Score \| Acción (⚫ SALIR / 🔴 REDUCIR FUERTE / 🟠 REDUCIR PARCIAL / 🟢 AUMENTAR / 🟡 MANTENER). Gráfico scatter SELL_SCORE vs Desviación con umbrales. Resumen de texto por categoría |
+| 70 | Código | **Capa 1** redefine `sell_score(tk)` (misma lógica que celda 67, sobrescribe sin conflicto). **Capa 2** rebalanceo hipotético: simula portafolio igual-peso desde hace 52 semanas, calcula `Desviación %` vs `TARGET_WEIGHT`. Construye `sell_tbl` con columnas Activo \| Precio \| SELL_SCORE \| Señal Técnica \| Zona DCA \| Peso actual % \| Desviación % \| DCA Score \| **Acción** (importada de `alert['ACCIÓN_FINAL']` — misma fuente que la alerta). Sin display ni chart — cómputo silencioso para uso interno |
 
 ---
 
@@ -264,7 +264,7 @@ Sentimiento (0–10):
   +0   VADER score < −0.10 (negativo)
 ```
 
-## SELL_SCORE — señales de salida
+## SELL_SCORE — señales técnicas bajistas
 
 ```
 SELL_SCORE (0–100) = suma de señales técnicas bajistas diarias + ST semanal
@@ -275,14 +275,25 @@ SELL_SCORE (0–100) = suma de señales técnicas bajistas diarias + ST semanal
   +15  precio > BBu (fuera de banda superior Bollinger)
   +10  ADX > 30 Y MDI > PDI (tendencia bajista fuerte)
   +15  SuperTrend semanal = −1
-
-Acciones por umbral:
-  ⚫ SALIR           → SELL_SCORE > 80
-  🔴 REDUCIR FUERTE  → SELL_SCORE > 70 O desviación peso > 60%
-  🟠 REDUCIR PARCIAL → SELL_SCORE > 45 O desviación peso > 40%
-  🟢 AUMENTAR        → DCA Score ≥ 55 Y desviación peso < −40%
-  🟡 MANTENER        → sin señales relevantes
 ```
+
+## ACCIÓN_FINAL — señal unificada (7 reglas de prioridad)
+
+`ACCIÓN_FINAL` combina el SELL_SCORE técnico con la zona DCA para emitir
+una única señal sin contradicciones. Las reglas se evalúan en orden:
+
+```
+1. SELL_SCORE > 70                           → 🔴 REDUCIR / SALIR
+2. SELL_SCORE > 45                           → 🟠 REDUCIR PARCIAL
+3. Zona == '⚫ FUERA' (perdió SMA40)          → ⚫ PAUSAR DCA
+4. Zona == '🔴 EUFORIA' (precio > SMA40×1.25) → 🟠 REDUCIR PARCIAL
+5. SELL_SCORE ≤ 45 Y Zona == '🔵 OPORTUNIDAD' → 🔵 DOBLAR APORTE
+6. SELL_SCORE ≤ 45 Y Zona == '🟢 PULLBACK'    → 🟢 SOBREPONDERAR
+7. resto                                      → 🟡 APORTE NORMAL
+```
+
+Las reglas de venta (1–2) prevalecen sobre cualquier señal de compra,
+eliminando la contradicción entre §15 (zonas DCA) y §17 (señales técnicas).
 
 ## Notas
 
