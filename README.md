@@ -1,17 +1,20 @@
 # Crypto DCA Analyzer
 
-Sistema de análisis cuantitativo de criptomonedas que produce un plan de inversión mensual mediante DCA (Dollar-Cost Averaging). El análisis completo y la alerta mensual se generan y muestran directamente en el notebook — sin dependencias externas ni credenciales.
+Sistema de análisis cuantitativo de criptomonedas que produce un plan de inversión mensual mediante DCA (Dollar-Cost Averaging). El análisis completo y las alertas se generan y muestran directamente en el notebook — sin credenciales ni servicios externos de pago.
 
 ## ¿Qué hace?
 
-El notebook `crypto_analysis.ipynb` ejecuta un pipeline completo de 66 celdas:
+El notebook `crypto_analysis.ipynb` ejecuta un pipeline completo de 71 celdas:
 
 1. Descarga el **top-20 de criptos** por capitalización de mercado (CoinGecko) en tiempo real
-2. Calcula **indicadores técnicos** sobre datos diarios y semanales: SMA, RSI, MACD, ATR, Fibonacci, SuperTrend
-3. Genera un **score DCA 0–100** por activo con dos pilares: calidad de tendencia + valor de entrada
-4. Asigna **capital mensual** solo a activos en uptrend confirmado (precio > SMA40 semanal)
-5. **Backtestea** la estrategia con walk-forward sin lookahead (~4–5 años de historia)
-6. Imprime una **alerta mensual completa** con ranking, zonas de entrada, RSI y señal SuperTrend
+2. Calcula **indicadores técnicos** sobre datos diarios y semanales: EMA, RSI, MACD, ATR, Bollinger, Fibonacci, SuperTrend, ADX
+3. Analiza el **sentimiento de noticias** (4 feeds RSS, VADER) y el **Fear & Greed Index** (Alternative.me) sin API key
+4. Detecta el **régimen de mercado** (BULL / NEUTRAL / BEAR) con un HMM gaussiano sobre BTC semanal
+5. Genera un **score DCA 0–100** por activo con tres pilares: tendencia (55) + valor de entrada (35) + sentimiento (10)
+6. Asigna **capital mensual** con HRP-CVaR (Riskfolio-Lib) solo a los top-5 altcoins por momentum, más el sleeve de convicción BTC/ETH
+7. **Backtestea** la estrategia con walk-forward sin lookahead (~4–5 años de historia)
+8. Calcula **señales de venta y rebalanceo**: SELL_SCORE técnico + desviación del peso objetivo (equal-weight 5%)
+9. Imprime una **alerta mensual completa** con ranking, zonas de entrada, RSI y señal SuperTrend
 
 ---
 
@@ -20,8 +23,9 @@ El notebook `crypto_analysis.ipynb` ejecuta un pipeline completo de 66 celdas:
 ```bash
 git clone https://github.com/wilwil186/crypt-analysis.git
 cd crypt-analysis
-bash install_talib.sh      # compila TA-Lib nativo + instala todas las dependencias Python
+bash install_talib.sh      # compila TA-Lib nativo + instala dependencias base
 source venv/bin/activate
+pip install riskfolio-lib hmmlearn feedparser vaderSentiment
 ```
 
 `install_talib.sh` instala: `numpy`, `pandas`, `plotly`, `mplfinance`, `yfinance`, `TA-Lib`, `prophet`, `scikit-learn`, `scipy`.
@@ -33,18 +37,23 @@ source venv/bin/activate
 jupyter notebook crypto_analysis.ipynb
 ```
 
-Ejecuta las celdas **de arriba a abajo** — el notebook es stateful y orden-dependiente. Las variables `UNIVERSE` y `CLASE` se definen en la celda 03 y son consumidas por todo lo demás.
+Ejecuta las celdas **de arriba a abajo** — el notebook es stateful y orden-dependiente.
 
 ## Parámetros clave
 
-En la celda de `CONFIGURACIÓN GLOBAL` (celda 03) y en parámetros DCA (celda 33):
-
 ```python
+# Celda 03 — configuración global
 PRIMARY           = 'BTC-USD'  # activo para el análisis técnico profundo (§2–12)
-MONTHLY_CAPITAL   = 200        # capital que inviertes cada mes (USD)
 MAX_CRYPTO        = 20         # tamaño del universo (top-N por capitalización)
-CONVICTION_CRYPTO = 0.30       # % fijo reservado a BTC + ETH (sleeve de convicción)
+BUY_TH, SELL_TH  = 4, -4      # umbrales del score técnico diario
+TARGET_WEIGHT     = 1/20       # peso objetivo por activo en §17 (igual-peso 5%)
+REBAL_THRESHOLD   = 0.40       # umbral de rebalanceo (±40% del target)
+
+# Celda 36 — parámetros DCA
+MONTHLY_CAPITAL   = 200        # capital que inviertes cada mes (USD)
 MAX_PER_ASSET     = 0.30       # tope máximo por activo individual
+TOP_N             = 5          # máx. altcoins en el sleeve tendencia (por MOM26)
+CONVICTION_CRYPTO = 0.30       # % fijo reservado a BTC + ETH
 ```
 
 ---
@@ -61,131 +70,148 @@ MAX_PER_ASSET     = 0.30       # tope máximo por activo individual
 |-------|------|----------|
 | 01 | Markdown | Encabezado de sección |
 | 02 | Código | Importaciones: `numpy`, `pandas`, `yfinance`, `talib`, `plotly`, `scipy`, `sklearn`, `IPython.display` |
-| 03 | Código | **`CONFIGURACIÓN GLOBAL`** — define `PRIMARY`, `INTERVAL`, `PERIOD`, universo dinámico de top-20 cryptos desde CoinGecko (con fallback hardcodeado), `BUY_TH`/`SELL_TH`, paleta de colores `COL` |
+| 03 | Código | **`CONFIGURACIÓN GLOBAL`** — define `PRIMARY`, `INTERVAL`, `PERIOD`, universo dinámico top-20 desde CoinGecko (con fallback hardcodeado), `BUY_TH`/`SELL_TH`, `TARGET_WEIGHT`, `REBAL_THRESHOLD`, paleta `COL` |
+| 04 | Código | `fetch_fng()` — consulta `api.alternative.me/fng` y expone `FNG_VALUE` (0–100) y `FNG_LABEL`; badge de color 🟢🟡🟠🔴 |
 
 ### §2 — Adquisición y Calidad de Datos
 | Celda | Tipo | Qué hace |
 |-------|------|----------|
-| 04 | Markdown | Encabezado de sección |
-| 05 | Código | `get_data(ticker)` — descarga OHLCV diario limpio via yfinance; descarga paralela para todo `UNIVERSE` en `DATA` |
-| 06 | Código | Reporte de calidad de datos: retorno diario medio, volatilidad anualizada, días faltantes y fecha de inicio por activo |
+| 05 | Markdown | Encabezado de sección |
+| 06 | Código | `get_data(ticker)` — descarga OHLCV diario limpio via yfinance; descarga paralela para todo `UNIVERSE` en `DATA` |
+| 07 | Código | Reporte de calidad de datos: retorno diario medio, volatilidad anualizada, días faltantes y fecha de inicio por activo |
 
 ### §3 — Motor de Indicadores Técnicos
 | Celda | Tipo | Qué hace |
 |-------|------|----------|
-| 07 | Markdown | Descripción de los indicadores calculados |
-| 08 | Código | `compute_indicators(d)` — añade al DataFrame: SMA20/50/200, EMA12/26, RSI(14), MACD, Bandas de Bollinger, ATR, OBV, VWAP, Stochastic, CCI, Williams %R, ADX; aplica a todos los activos en `INDI` |
+| 08 | Markdown | Descripción de los indicadores calculados |
+| 09 | Código | `compute_indicators(d)` — añade EMA 4/9/20/50/200, SAR, ADX, PDI/MDI, RSI, MACD, Stochastic, MFI, CCI, ATR, Bollinger, OBV, CMF, VWAP; aplica a todos los activos en `INDI` |
 
 ### §4 — Indicadores Avanzados
 | Celda | Tipo | Qué hace |
 |-------|------|----------|
-| 09 | Markdown | Descripción de Fibonacci, Volume Profile y CVD |
-| 10 | Código | `fibonacci_levels(d)` — retrocesos automáticos sobre el swing alto/bajo de los últimos 180 días; `volume_profile(d)` — POC y Value Area (VAH/VAL) con histograma de volumen por precio; `cvd(d)` — Cumulative Volume Delta como proxy de order flow |
-| 11 | Código | Gráfico interactivo (Plotly): precio + Fibonacci + Volume Profile lateral + CVD sobre el activo `PRIMARY` |
+| 10 | Markdown | Descripción de Fibonacci, Volume Profile y CVD |
+| 11 | Código | `fibonacci_levels(d)` — retrocesos automáticos sobre el swing de 180 días; `volume_profile(d)` — POC y Value Area; `cvd(d)` — Cumulative Volume Delta |
+| 12 | Código | Gráfico interactivo: precio + Fibonacci + Volume Profile lateral + CVD sobre `PRIMARY` |
 
 ### §5 — Soporte y Resistencia Dinámicos
 | Celda | Tipo | Qué hace |
 |-------|------|----------|
-| 12 | Markdown | Descripción del método de detección |
-| 13 | Código | `support_resistance(d)` — detecta swing points con `scipy.argrelextrema`, los agrupa por proximidad (tolerancia 1.5%) y devuelve los niveles más relevantes; gráfico con zonas S/R sobre `PRIMARY` |
+| 13 | Markdown | Descripción del método de detección |
+| 14 | Código | `support_resistance(d)` — swing points con `scipy.argrelextrema`, agrupados por proximidad (1.5%); gráfico con zonas S/R |
 
 ### §6 — Detección de Patrones Chartistas
 | Celda | Tipo | Qué hace |
 |-------|------|----------|
-| 14 | Markdown | Descripción de los patrones detectados |
-| 15 | Código | `detect_candle_patterns(d)` — escanea 61 patrones de velas de TA-Lib activos en la última vela; `detect_structure_patterns(d)` — detecta triángulos, doble techo/suelo, banderas; imprime resumen para `PRIMARY` |
+| 15 | Markdown | Descripción de los patrones detectados |
+| 16 | Código | `detect_candle_patterns(d)` — 61 patrones TA-Lib en la última vela; `detect_structure_patterns(d)` — triángulos, doble techo/suelo, banderas |
 
 ### §7 — Sistema de Scoring
 | Celda | Tipo | Qué hace |
 |-------|------|----------|
-| 16 | Markdown | Descripción del score y sus componentes |
-| 17 | Código | `score_series(x)` — score técnico vectorizado (Serie temporal): pondera RSI, MACD, SMA cross, Bollinger, ADX, OBV; `label(score)` — traduce score a recomendación (COMPRAR / MANTENER / VENDER / ESPERAR); aplica a `PRIMARY` |
+| 17 | Markdown | Descripción del score y sus componentes |
+| 18 | Código | `score_series(x)` — score técnico vectorizado: RSI, MACD, SMA cross, Bollinger, ADX, OBV; `label(score)` — COMPRAR / MANTENER / VENDER / ESPERAR |
 
 ### §8 — Backtesting de Señales
 | Celda | Tipo | Qué hace |
 |-------|------|----------|
-| 18 | Markdown | Descripción de la metodología de backtest |
-| 19 | Código | `backtest(x, score)` — estrategia long/flat: entra cuando `score >= BUY_TH`, sale cuando `score <= SELL_TH`; aplica comisión 0.1% por operación; compara vs buy & hold |
-| 20 | Código | Gráfico de curva de equity y drawdown del backtest vs buy & hold |
+| 19 | Markdown | Descripción de la metodología |
+| 20 | Código | `backtest(x, score)` — long/flat con comisión 0.1%; compara vs buy & hold |
+| 21 | Código | Gráfico de curva de equity y drawdown |
 
 ### §9 — Análisis de Correlaciones
 | Celda | Tipo | Qué hace |
 |-------|------|----------|
-| 21 | Markdown | Descripción del análisis |
-| 22 | Código | Matriz de correlación de retornos diarios entre todos los activos; beta respecto a `PRIMARY`; heatmap interactivo |
-| 23 | Código | Correlación rolling 30 días entre el activo más y menos correlacionado con `PRIMARY` |
+| 22 | Markdown | Descripción del análisis |
+| 23 | Código | Matriz de correlación de retornos diarios; beta respecto a `PRIMARY`; heatmap interactivo |
+| 24 | Código | Correlación rolling 30 días entre el activo más y menos correlacionado con `PRIMARY` |
 
 ### §10 — Modelos Predictivos
 | Celda | Tipo | Qué hace |
 |-------|------|----------|
-| 24 | Markdown | Descripción de los dos modelos |
-| 25 | Código | **Prophet** — forecast de precio a 30 días con intervalo de confianza 80%; gráfico con componentes de tendencia y estacionalidad |
-| 26 | Código | **GradientBoosting** — clasificador direccional (sube / baja a 5 días): features = RSI, MACD, ATR, retornos rezagados, Bollinger width; muestra accuracy, matriz de confusión y predicción para la próxima semana |
+| 25 | Markdown | Descripción de los dos modelos |
+| 26 | Código | **Prophet** — forecast de precio a 30 días con intervalo de confianza 80% |
+| 27 | Código | **GradientBoosting** — clasificador direccional a 5 días (RSI, MACD, ATR, retornos rezagados); accuracy + matriz de confusión |
+
+### §16 — Sentimiento de Noticias
+| Celda | Tipo | Qué hace |
+|-------|------|----------|
+| 28 | Markdown | Descripción del análisis RSS + VADER |
+| 29 | Código | `fetch_news_sentiment(tickers)` — lee hasta 60 artículos de 4 feeds RSS (CoinTelegraph, CoinDesk, CryptoSlate, Decrypt); aplica VADER al título + resumen; devuelve `NEWS_SENTIMENT = {ticker: {score, n_articles, headlines}}`; tabla coloreada verde/rojo/gris + los 2 titulares más extremos por activo |
 
 ### §11 — Dashboard Multi-Activo
 | Celda | Tipo | Qué hace |
 |-------|------|----------|
-| 27 | Markdown | Descripción del dashboard |
-| 28 | Código | Aplica el pipeline completo (score + label + confianza) a todos los activos del universo; construye tabla resumen `dash` |
-| 29 | Código | Heatmap de barras con score por activo (verde = COMPRAR, rojo = VENDER); tabla HTML con recomendaciones y métricas |
+| 30 | Markdown | Descripción del dashboard |
+| 31 | Código | Aplica score + label + confianza a todos los activos; añade columna `Sentiment` (😀/😐/😰) desde `NEWS_SENTIMENT`; tabla estilizada con colores por recomendación |
+| 32 | Código | Heatmap de barras con score por activo; líneas de umbral compra/venta |
 
 ### §12 — Conclusiones Accionables
 | Celda | Tipo | Qué hace |
 |-------|------|----------|
-| 30 | Markdown | Encabezado |
-| 31 | Código | Síntesis de `PRIMARY`: calcula TP (precio + 2.5×ATR), SL (precio − 1.5×ATR), ratio R/R; imprime recomendación con contexto de mercado |
-
-### §12b — Régimen de Mercado (HMM)
-| Celda | Tipo | Qué hace |
-|-------|------|----------|
-| 37 | Markdown | Descripción del modelo de régimen de mercado |
-| 38 | Código | Entrena un `GaussianHMM` de 3 estados sobre BTC-USD semanal con features: retorno 4 semanas, volatilidad rolling 8 semanas, RSI semanal. Etiqueta los estados como BULL/NEUTRAL/BEAR por retorno medio histórico. Expone `REGIME_NOW`. Muestra gráfico Plotly con precio BTC coloreado por régimen |
+| 33 | Markdown | Encabezado |
+| 34 | Código | Síntesis de `PRIMARY`: TP (precio + 2.5×ATR), SL (precio − 1.5×ATR), ratio R/R; recomendación con contexto de mercado |
 
 ---
 
 ### §13 — Motor DCA (producto principal)
 | Celda | Tipo | Qué hace |
 |-------|------|----------|
-| 32 | Markdown | Introducción al motor DCA de largo plazo |
-| 33 | Código | **Parámetros DCA**: `MONTHLY_CAPITAL`, `MAX_PER_ASSET`, `WK_PERIOD`; descarga datos **semanales** (`1wk`) de 5 años para todo el universo en `WK` |
-| 34 | Código | `supertrend_signal(h,l,c)` — SuperTrend basado en ATR×factor (inspirado en OctoBot); `lt_features(d)` — indicadores semanales LP: SMA10/30/40, RSI, MACD, MOM26/52, ATR, DDhigh, SuperTrend; `dca_score(x)` — score DCA 0–100 (tendencia 0–60 + valor entrada 0–40 + bonus ST); aplica a todo `WK` generando `WKI` y `DCA` |
-| 35 | Markdown | Descripción de la asignación de capital |
-| 36 | Código | Filtra activos elegibles (precio > SMA40 + `trend_quality ≥ 35`); calcula pesos con **HRP-CVaR** (Riskfolio-Lib) usando retornos semanales alineados; fallback a score-proporcional; tope `MAX_PER_ASSET`; tabla `alloc` con USD asignados este mes |
-| 39 | Código | Gráfico de asignación: dona de pesos + barras de score DCA por activo |
-| 40 | Markdown | Descripción de los niveles de entrada |
-| 39 | Código | Calcula zonas de entrada por activo: SMA30 (sobreponderar), SMA40 (oportunidad fuerte), SMA40×1.25 (euforia) |
-| 40 | Markdown | Descripción de la validación DCA vs Lump Sum |
-| 41 | Código | `dca_sim(close, amount)` — simula DCA aportando cantidad fija cada semana; compara vs inversión única (Lump Sum) sobre `PRIMARY` y la cesta diversificada |
-| 42 | Markdown | Recomendación final de asignación |
-| 43 | Código | Tabla HTML interactiva con el plan DCA: activo, aporte en USD, precio, niveles SMA30/SMA40, señal SuperTrend, estado de zona |
+| 35 | Markdown | Introducción al motor DCA de largo plazo y filosofía del score |
+| 36 | Código | **Parámetros DCA**: `MONTHLY_CAPITAL`, `MAX_PER_ASSET`, `TOP_N`, `WK_PERIOD`; `get_weekly()` descarga datos semanales (`1wk`) de 5 años en `WK` |
+| 37 | Código | `supertrend_signal(h,l,c)` — SuperTrend ATR×3 (OctoBot-inspired); `lt_features(d)` — indicadores semanales LP; `dca_score(x, ticker)` — score DCA 0–100 con **3 pilares**: tendencia 0–55 + valor entrada 0–35 + sentimiento 0–10; penalización FNG > 80 (−15 en entrada); genera `WKI` y `DCA` |
+
+### §12b — Régimen de Mercado (HMM)
+| Celda | Tipo | Qué hace |
+|-------|------|----------|
+| 38 | Markdown | Descripción del modelo HMM de 3 estados |
+| 39 | Código | `GaussianHMM(n_components=3)` sobre BTC-USD semanal; features: retorno 4 semanas, volatilidad rolling 8 semanas, RSI semanal; etiqueta estados BULL/NEUTRAL/BEAR por retorno medio; expone `REGIME_NOW`; gráfico Plotly con precio coloreado por régimen |
+
+### §13 (cont.) — Asignación DCA
+| Celda | Tipo | Qué hace |
+|-------|------|----------|
+| 40 | Markdown | Descripción del filtro de elegibilidad |
+| 41 | Código | Filtra elegibles (precio > SMA40, `trend_quality ≥ 35`); rankea altcoins por MOM26 y conserva los **top-`TOP_N`** (BTC/ETH excluidos del ranking); calcula pesos con **HRP-CVaR** (Riskfolio-Lib) sobre retornos semanales alineados (union+ffill); fallback a score-proporcional; tope `MAX_PER_ASSET`; tabla `alloc` |
+| 42 | Código | Gráfico: dona de pesos + barras de score DCA |
+| 43 | Markdown | Descripción de los niveles de entrada |
+| 44 | Código | Zonas de entrada por activo: SMA30 (sobreponderar), SMA40 (oportunidad fuerte), SMA40×1.25 (euforia) |
+| 45 | Markdown | Descripción de la validación DCA vs Lump Sum |
+| 46 | Código | `dca_sim(close, amount)` — simula DCA semanal y compara vs inversión única (Lump Sum) |
+| 47 | Markdown | Recomendación final de asignación |
+| 48 | Código | Tabla HTML con el plan DCA: activo, USD asignados, precio, niveles SMA, señal SuperTrend |
 
 ### §14 — Optimización de Rentabilidad
 | Celda | Tipo | Qué hace |
 |-------|------|----------|
-| 44 | Markdown | Introducción a las tres mejoras de optimización |
-| 45 | Markdown | Encabezado §14.1 |
-| 46 | Código | `perf_stats(close)` — métricas ajustadas por riesgo: CAGR, volatilidad, Sharpe, Sortino, MaxDrawdown, Calmar; tabla comparativa de todos los activos |
-| 47 | Código | Mapa riesgo-retorno: scatter CAGR vs volatilidad, tamaño del punto = Sharpe |
-| 48 | Markdown | Encabezado §14.2 — sleeve de convicción |
-| 51 | Código | Define `CONVICTION_CRYPTO = 0.30` (BTC + ETH siempre); aplica `REGIME_NOW`: BEAR=solo convicción, NEUTRAL=tendencia al 50%, BULL=sin cambios; combina en `final_w` y `final_alloc` |
-| 50 | Markdown | Encabezado §14.3 — backtest walk-forward |
-| 51 | Código | Construye `PX` (matriz de precios semanal alineada con unión de fechas + ffill); `weights_at(t, mode)` — calcula pesos en cada fecha sin lookahead; `run_dca(mode)` — simula DCA semana a semana; compara estrategia convicción+tendencia vs equal-weight vs solo-BTC |
-| 52 | Código | Gráfico de curvas de equity de las tres estrategias; imprime IRR anual y MaxDrawdown |
-| 53 | Markdown | Encabezado §14.4 — plan final |
-| 54 | Código | Tabla HTML final del plan optimizado con métricas del backtest: IRR, retorno total, MaxDD, múltiplo |
+| 49 | Markdown | Introducción a las mejoras de optimización |
+| 50 | Markdown | Encabezado §14.1 |
+| 51 | Código | `perf_stats(close)` — CAGR, volatilidad, Sharpe, Sortino, MaxDrawdown, Calmar; tabla comparativa de todos los activos |
+| 52 | Código | Mapa riesgo-retorno: scatter CAGR vs volatilidad, tamaño del punto = Sharpe |
+| 53 | Markdown | Encabezado §14.2 — sleeve de convicción |
+| 54 | Código | `CONVICTION_CRYPTO = 0.30` (BTC+ETH fijo); aplica `REGIME_NOW`: BEAR=solo convicción, NEUTRAL=tendencia al 50%, BULL=sin cambios; aplica reducción FNG > 80 (tendencia al 60%); combina en `final_w` y `final_alloc` |
+| 55 | Markdown | Encabezado §14.3 — backtest walk-forward |
+| 56 | Código | Matriz `PX` (union+ffill); `weights_at(t, mode)` — pesos en cada fecha sin lookahead (modos: `btc`, `equal`, `conviction`, `hrp`, `strategy`); `run_dca(mode)` — simula DCA semana a semana |
+| 57 | Código | Gráfico de curvas de equity; IRR anual y MaxDrawdown |
+| 58 | Markdown | Encabezado §14.4 — plan final |
+| 59 | Código | Tabla HTML del plan optimizado con IRR, retorno total, MaxDD, múltiplo |
 
-### §15 — Validación final y Alerta Mensual
+### §15 — Sistema de Alertas Semanales
 | Celda | Tipo | Qué hace |
 |-------|------|----------|
-| 55 | Markdown | Introducción a la sección final |
-| 56 | Markdown | Encabezado §15.1 |
-| 57 | Código | Construye `final_w2` (pesos finales = convicción BTC/ETH + tendencia resto); `sleeve_of(tk)` para etiquetar cada activo; tabla `alloc2` |
-| 58 | Markdown | Encabezado §15.2 — re-validación walk-forward |
-| 59 | Código | Re-ejecuta walk-forward comparando 4 variantes: estrategia completa, solo convicción (BTC+ETH), equal-weight, solo BTC; tabla de métricas con Sharpe y Calmar |
-| 60 | Código | Gráfico comparativo de las 4 curvas de valor acumulado |
-| 61 | Markdown | Encabezado §15.3 — alerta mensual |
-| 62 | Código | `monthly_alert(plan_weights)` — recorre **todos los activos del universo** (no solo los del plan); calcula zona de precio (euforia / pullback / oportunidad / normal / fuera), distancia a SMA30/SMA40, RSI, SuperTrend; devuelve `alert` con las 20 criptos ordenadas por urgencia |
-| 63 | Código | **Celda final** — imprime el plan DCA mensual completo: cartera del mes con % de aporte por activo, ranking top-20 con barra de score visual, sección de activos fuera de tendencia, sección en vigilancia, e instrucciones de acción |
+| 60 | Markdown | Introducción a la sección final |
+| 61 | Markdown | Encabezado §15.1 |
+| 62 | Código | `final_w2` (convicción + tendencia); `sleeve_of(tk)`; tabla `alloc2` con distribución final |
+| 63 | Markdown | Encabezado §15.2 — re-validación walk-forward |
+| 64 | Código | Walk-forward v2: estrategia completa vs solo-convicción vs equal-weight vs solo-BTC; tabla con Sharpe y Calmar |
+| 65 | Código | Gráfico comparativo de las 4 curvas de valor acumulado |
+| 66 | Markdown | Encabezado §15.3 — alerta mensual |
+| 67 | Código | `monthly_alert(plan_weights)` — recorre todos los activos del universo; clasifica por zona (euforia / pullback / oportunidad / normal / fuera de tendencia); devuelve `alert` ordenada por urgencia |
+| 68 | Código | **Celda final de alerta** — imprime badge FNG + plan DCA mensual completo: cartera con % por activo, ranking top-20 con barra de score visual, activos fuera de tendencia, activos en vigilancia, instrucciones de acción |
+
+### §17 — Señales de Venta y Rebalanceo
+| Celda | Tipo | Qué hace |
+|-------|------|----------|
+| 69 | Markdown | Descripción de las dos capas de señales |
+| 70 | Código | **Capa 1** `sell_score(tk)` (0–100): +25 EMA bajista (Close < EMA50 < EMA200), +20 RSI > 75, +15 MACD < señal con histograma decreciendo 3 velas, +15 precio > BBu, +10 ADX > 30 con MDI > PDI, +15 SuperTrend semanal −1. **Capa 2** rebalanceo hipotético: simula portafolio igual-peso desde hace 52 semanas, calcula desviación actual vs `TARGET_WEIGHT`. **Tabla consolidada**: Activo \| Precio \| SELL_SCORE \| Señal Técnica \| Peso actual % \| Desviación % \| DCA Score \| Acción (⚫ SALIR / 🔴 REDUCIR FUERTE / 🟠 REDUCIR PARCIAL / 🟢 AUMENTAR / 🟡 MANTENER). Gráfico scatter SELL_SCORE vs Desviación con umbrales. Resumen de texto por categoría |
 
 ---
 
@@ -193,45 +219,75 @@ MAX_PER_ASSET     = 0.30       # tope máximo por activo individual
 
 | Indicador | Uso |
 |---|---|
-| SMA 10 / 30 / 40 (semanal) | Tendencia de corto, medio y largo plazo; filtro de elegibilidad DCA |
-| SMA 20 / 50 / 200 (diario) | Análisis técnico del activo principal |
-| RSI (14) | Momentum y zonas de sobrecompra/sobreventa |
-| MACD (12/26/9) | Confirmación de tendencia y señales de cruce |
-| ATR (14) | Volatilidad, niveles de stop y SuperTrend |
-| Bandas de Bollinger | Compresión/expansión de volatilidad |
-| SuperTrend (ATR×3, período 10) | Filtro de dirección tendencial (inspirado en OctoBot) |
-| Stochastic RSI | Señales de sobrecompra/sobreventa de segundo orden |
-| ADX | Fuerza de la tendencia |
-| OBV / CVD | Order flow y presión compradora/vendedora |
+| EMA 4 / 9 / 20 / 50 / 200 (diario) | Tendencia y cruces de media |
+| SMA 10 / 30 / 40 (semanal) | Filtro de elegibilidad DCA y niveles de entrada |
+| RSI (14) | Momentum, sobrecompra/sobreventa, señal de venta |
+| MACD (12/26/9) | Confirmación de tendencia, divergencia, señal de venta |
+| ATR (14) | Volatilidad, niveles de stop, SuperTrend |
+| Bandas de Bollinger | Extensión de precio, señal de venta (sobre BBu) |
+| ADX / PDI / MDI | Fuerza y dirección de tendencia; señal de venta (MDI > PDI) |
+| SuperTrend (ATR×3, período 10) | Dirección tendencial diaria y semanal (OctoBot-inspired) |
+| Stochastic / MFI / CCI / Williams %R | Oscilladores de momentum secundarios |
+| OBV / CMF / CVD | Order flow y presión compradora/vendedora |
 | Volume Profile (POC/VAH/VAL) | Zonas de valor y precio de control |
-| Fibonacci (automático) | Retrocesos sobre el swing reciente |
+| Fibonacci (automático) | Retrocesos sobre el swing de 180 días |
+| SAR Parabólico | Trailing stop dinámico |
 | Prophet | Forecast de precio a 30 días con incertidumbre |
 | GradientBoosting | Clasificador direccional a 5 días |
 | HMM Gaussiano (3 estados) | Régimen de mercado BULL/NEUTRAL/BEAR sobre BTC semanal |
-| HRP-CVaR (Riskfolio-Lib) | Pesos óptimos del sleeve de tendencia por Hierarchical Risk Parity |
+| HRP-CVaR (Riskfolio-Lib) | Pesos óptimos del sleeve tendencia por Hierarchical Risk Parity |
+| VADER Sentiment | Score de sentimiento (−1 a +1) sobre noticias RSS cripto |
+| Fear & Greed Index | Sentimiento agregado del mercado (0–100, Alternative.me) |
 
 ## Score DCA — cómo se calcula
 
 ```
-Score DCA (0–100) = Tendencia (0–60) + Valor de entrada (0–40) + Bonus SuperTrend
+Score DCA (0–100) = Tendencia (0–55) + Valor de entrada (0–35) + Sentimiento (0–10)
 
-Tendencia:
+Tendencia (máx 55):
   +20  precio > SMA40 semanal (uptrend confirmado)
   +15  SMA10 > SMA30 > SMA40  (alineación alcista perfecta)
   +15  MOM26 > 0              (momentum positivo a 6 meses)
-  +10  MACD > señal           (momentum semanal al alza)
-  +5   SuperTrend alcista ↑   (bonus)
+  +5   MACD > señal           (momentum semanal al alza)
+  +5   SuperTrend alcista ↑   (bonus, cap en 55)
 
-Valor de entrada:
+Valor de entrada (máx 35):
   +20 / +12 / +4   precio cerca / algo extendido / muy extendido vs SMA10
-  +10 / +5         RSI < 65 / RSI < 75
-  +10 / +6 / +3    drawdown desde máximo en zona óptima (-35% a -8%) / moderada / severa
+  +7 / +3          RSI < 65 / RSI < 75
+  +8 / +5 / +2     drawdown desde máximo en zona óptima / moderada / severa
+  −15              penalización si FNG > 80 (euforia extrema)
+
+Sentimiento (0–10):
+  +10  VADER score > 0.10 (positivo)
+  +5   VADER score 0 a 0.10 (levemente positivo)
+  +2   VADER score −0.10 a 0 (levemente negativo)
+  +0   VADER score < −0.10 (negativo)
+```
+
+## SELL_SCORE — señales de salida
+
+```
+SELL_SCORE (0–100) = suma de señales técnicas bajistas diarias + ST semanal
+
+  +25  Close < EMA50 < EMA200 (downtrend confirmado)
+  +20  RSI > 75 (sobrecompra extrema)
+  +15  MACD < señal Y histograma decreciendo 3 velas consecutivas
+  +15  precio > BBu (fuera de banda superior Bollinger)
+  +10  ADX > 30 Y MDI > PDI (tendencia bajista fuerte)
+  +15  SuperTrend semanal = −1
+
+Acciones por umbral:
+  ⚫ SALIR           → SELL_SCORE > 80
+  🔴 REDUCIR FUERTE  → SELL_SCORE > 70 O desviación peso > 60%
+  🟠 REDUCIR PARCIAL → SELL_SCORE > 45 O desviación peso > 40%
+  🟢 AUMENTAR        → DCA Score ≥ 55 Y desviación peso < −40%
+  🟡 MANTENER        → sin señales relevantes
 ```
 
 ## Notas
 
-- Los datos se descargan en tiempo real al ejecutar: CoinGecko (universo) y Yahoo Finance (precios + histórico)
-- Ambas fuentes tienen fallback a cestas hardcodeadas si la API falla
+- Los datos se descargan en tiempo real: CoinGecko (universo), Yahoo Finance (precios), Alternative.me (FNG), feeds RSS (noticias)
+- Todas las fuentes tienen fallback si la API falla — el notebook siempre termina
 - Los archivos `.html` generados están en `.gitignore`
-- El notebook se ejecuta y commitea con sus outputs para que el ranking y las predicciones sean visibles directamente en GitHub
+- El notebook se commitea con sus outputs para que el ranking sea visible directamente en GitHub
 - **Educativo — no es asesoría financiera**
